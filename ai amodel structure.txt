@@ -1,0 +1,68 @@
+ai-trainer-platform/
+├── prisma/
+│   ├── schema.prisma
+│   ├── migrations/
+│   └── seed.ts
+├── src/
+│   ├── app/
+│   │   ├── (marketing)/           # landing, about, how-it-works, faq
+│   │   ├── (auth)/                # login, register, verify, reset
+│   │   ├── (worker)/              # dashboard, profile, assessments,
+│   │   │                          # tasks, earnings, wallet, withdrawals
+│   │   ├── (client)/client/       # client portal
+│   │   ├── (admin)/admin/         # admin console
+│   │   └── api/
+│   │       ├── auth/
+│   │       ├── profile/
+│   │       ├── assessments/
+│   │       ├── capabilities/
+│   │       ├── tasks/
+│   │       ├── earnings/
+│   │       ├── wallet/
+│   │       ├── withdrawals/
+│   │       ├── notifications/
+│   │       ├── admin/
+│   │       └── client/
+│   ├── server/
+│   │   ├── services/              # framework-agnostic business logic
+│   │   │   ├── auth.service.ts
+│   │   │   ├── assessment.service.ts
+│   │   │   ├── capability.service.ts       # rules engine
+│   │   │   ├── task-assignment.service.ts
+│   │   │   ├── task.service.ts
+│   │   │   ├── quality.service.ts
+│   │   │   ├── wallet.service.ts           # ledger ops
+│   │   │   ├── rate.service.ts
+│   │   │   ├── withdrawal.service.ts
+│   │   │   ├── payment/                    # provider abstraction
+│   │   │   │   ├── provider.interface.ts
+│   │   │   │   ├── stripe.provider.ts
+│   │   │   │   ├── wise.provider.ts
+│   │   │   │   ├── mpesa.provider.ts
+│   │   │   │   └── index.ts
+│   │   │   ├── fraud.service.ts
+│   │   │   ├── notification.service.ts
+│   │   │   └── audit.service.ts
+│   │   ├── repositories/          # thin Prisma wrappers
+│   │   ├── jobs/                  # BullMQ processors
+│   │   ├── queues/                # queue definitions
+│   │   ├── lib/                   # prisma client, redis, s3, mailer
+│   │   ├── auth/                  # NextAuth config, RBAC guards
+│   │   └── config/                # env, feature flags, business rules
+│   ├── components/
+│   │   ├── ui/                    # shadcn primitives
+│   │   ├── worker/
+│   │   ├── client/
+│   │   ├── admin/
+│   │   └── shared/                # Navbar, Sidebar, DataTable, etc.
+│   ├── lib/                       # client utils, hooks, api client
+│   ├── types/                     # shared TS types
+│   └── styles/
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── e2e/
+├── scripts/
+├── .env.example
+├── README.md
+└── DEPLOYMENT.md
