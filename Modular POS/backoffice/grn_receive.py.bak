@@ -1,0 +1,388 @@
+"""
+GRN Receive-from-PO window.
+
+Flow:
+  1. Pick an approved, unreceived LPO from the list.
+  2. The window walks through the LPO's lines one at a time.
+     For each line:
+       - Shows: short code, description, LPO qty, pack size, expected cost/pcs
+       - User enters: invoice qty (in packagings) and confirms cost/pcs
+       - If invoice qty == LPO qty (within tolerance): line is accepted,
+         appended to the received list below, move to next line.
+       - If mismatch: refuse, tell the user to request HQ to amend the LPO.
+  3. When all lines are accepted, the user clicks RECEIVE.
+     - Client POSTs /grn with all received lines.
+     - Then PATCHes /purchase_orders/<id>/receive to mark it done.
+     - Success message; form resets.
+"""
+
+import datetime
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+import requests
+
+from common.center import center_window_on_screen
+
+
+class GrnReceiveMixin:
+    """GRN window that consumes approved LPOs."""
+
+    def open_grn_window(self):
+        win = self.open_content_window("grn", "GRN - Receive",
+                                       group="inventory", icon=self.icon_stock)
+        if win is None:
+            return
+
+        self._grn_po = None
+        self._grn_pending_lines = []
+        self._grn_received_lines = []
+        self._grn_line_index = 0
+        self._grn_amend_needed = False
+        self._grn_po_index = {}
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        ttk.Button(top, text="Pick Approved LPO",
+                   command=self._open_grn_po_picker).pack(side="left")
+        self._grn_lpo_label_var = tk.StringVar(value="No LPO loaded")
+        ttk.Label(top, textvariable=self._grn_lpo_label_var,
+                  foreground="#333333").pack(side="left", padx=(12, 0))
+
+        current = ttk.LabelFrame(win, text="Current line")
+        current.pack(fill="x", padx=10, pady=(10, 4))
+
+        row1 = ttk.Frame(current)
+        row1.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row1, text="Code:").grid(row=0, column=0, sticky="w")
+        self._grn_code_var = tk.StringVar(value="-")
+        ttk.Entry(row1, textvariable=self._grn_code_var, width=14,
+                  state="readonly").grid(row=0, column=1, sticky="w", padx=(2, 12))
+        ttk.Label(row1, text="Description:").grid(row=0, column=2, sticky="w")
+        self._grn_desc_var = tk.StringVar(value="-")
+        ttk.Entry(row1, textvariable=self._grn_desc_var,
+                  state="readonly").grid(row=0, column=3, sticky="ew", padx=(2, 12))
+        row1.columnconfigure(3, weight=1)
+
+        row2 = ttk.Frame(current)
+        row2.pack(fill="x", padx=8, pady=(2, 2))
+        ttk.Label(row2, text="LPO Qty (packagings):").grid(row=0, column=0, sticky="w")
+        self._grn_lpo_qty_var = tk.StringVar(value="-")
+        ttk.Entry(row2, textvariable=self._grn_lpo_qty_var, width=10,
+                  state="readonly").grid(row=0, column=1, sticky="w", padx=(2, 14))
+        ttk.Label(row2, text="Pack size:").grid(row=0, column=2, sticky="w")
+        self._grn_pack_size_var = tk.StringVar(value="-")
+        ttk.Entry(row2, textvariable=self._grn_pack_size_var, width=8,
+                  state="readonly").grid(row=0, column=3, sticky="w", padx=(2, 14))
+        ttk.Label(row2, text="Cost/pcs (LPO):").grid(row=0, column=4, sticky="w")
+        self._grn_cost_var = tk.StringVar(value="-")
+        ttk.Entry(row2, textvariable=self._grn_cost_var, width=10,
+                  state="readonly").grid(row=0, column=5, sticky="w", padx=(2, 0))
+
+        row3 = ttk.Frame(current)
+        row3.pack(fill="x", padx=8, pady=(6, 6))
+        ttk.Label(row3, text="Invoice Qty (packagings):").grid(row=0, column=0, sticky="w")
+        self._grn_inv_qty_var = tk.StringVar()
+        e = ttk.Entry(row3, textvariable=self._grn_inv_qty_var, width=10)
+        e.grid(row=0, column=1, sticky="w", padx=(2, 14))
+        e.focus_set()
+
+        ttk.Label(row3, text="Invoice Cost/pcs:").grid(row=0, column=2, sticky="w")
+        self._grn_inv_cost_var = tk.StringVar()
+        ttk.Entry(row3, textvariable=self._grn_inv_cost_var, width=10).grid(
+            row=0, column=3, sticky="w", padx=(2, 14))
+
+        ttk.Button(row3, text="Confirm Line",
+                   command=self._grn_confirm_line).grid(row=0, column=4, sticky="w")
+
+        recv_box = ttk.LabelFrame(win, text="Confirmed lines (ready to receive)")
+        recv_box.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+        cols = ("code", "desc", "inv_qty", "pack_size", "total_pcs",
+                "cost", "total")
+        self._grn_tree = ttk.Treeview(recv_box, columns=cols,
+                                       show="headings", height=8)
+        for c, h, w in (("code", "Code", 90),
+                        ("desc", "Description", 220),
+                        ("inv_qty", "Inv Qty", 80),
+                        ("pack_size", "Pack", 60),
+                        ("total_pcs", "Total Pcs", 90),
+                        ("cost", "Cost/pcs", 90),
+                        ("total", "Line Total", 100)):
+            self._grn_tree.heading(c, text=h)
+            self._grn_tree.column(c, width=w,
+                                   anchor="e" if c in
+                                   ("inv_qty", "pack_size", "total_pcs",
+                                    "cost", "total") else "w")
+        self._grn_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        footer = ttk.Frame(win)
+        footer.pack(fill="x", padx=10, pady=(0, 10))
+        self._grn_progress_var = tk.StringVar(value="0 / 0 lines confirmed")
+        ttk.Label(footer, textvariable=self._grn_progress_var).pack(side="left")
+        self._grn_receive_btn = ttk.Button(
+            footer, text="RECEIVE", state="disabled",
+            command=self._grn_receive_all)
+        self._grn_receive_btn.pack(side="right")
+        ttk.Button(footer, text="Cancel",
+                   command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def _open_grn_po_picker(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Select an approved LPO")
+        dialog.transient(self)
+        dialog.grab_set()
+        center_window_on_screen(dialog, 640, 400)
+
+        top = ttk.Frame(dialog)
+        top.pack(fill="x", padx=10, pady=(10, 5))
+        ttk.Label(top, text="Approved and not yet received:").pack(side="left")
+        ttk.Button(top, text="Refresh",
+                   command=lambda: self._load_grn_po_list(tree)).pack(side="right")
+
+        tree = ttk.Treeview(dialog, columns=("lpo", "date", "supplier", "value"),
+                            show="headings")
+        for c, h, w in (("lpo", "LPO No.", 110),
+                        ("date", "Date", 100),
+                        ("supplier", "Supplier", 220),
+                        ("value", "Value", 100)):
+            tree.heading(c, text=h)
+            tree.column(c, width=w,
+                        anchor="e" if c == "value" else "w")
+        tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        def do_pick(*_):
+            sel = tree.selection()
+            if not sel:
+                return
+            po = self._grn_po_index.get(sel[0])
+            if not po:
+                return
+            dialog.destroy()
+            self._start_grn_for_po(po)
+
+        tree.bind("<Double-1>", do_pick)
+        ttk.Button(dialog, text="Use this LPO",
+                   command=do_pick).pack(side="right", padx=10, pady=(0, 10))
+        ttk.Button(dialog, text="Cancel",
+                   command=dialog.destroy).pack(side="right", pady=(0, 10))
+
+        self._load_grn_po_list(tree)
+
+    def _load_grn_po_list(self, tree):
+        for row in tree.get_children():
+            tree.delete(row)
+
+        def worker():
+            try:
+                r = requests.get(f"{self.SERVER}/purchase_orders",
+                                 params={"receivable": 1}, timeout=5)
+                orders = r.json() if r.status_code == 200 else []
+            except Exception as e:
+                self.after(0, lambda: self.message_error(
+                    "Error", f"Could not reach server: {e}"))
+                return
+            self.after(0, lambda: self._fill_grn_po_list(tree, orders))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fill_grn_po_list(self, tree, orders):
+        if not tree.winfo_exists():
+            return
+        for o in orders:
+            item = tree.insert(
+                "", "end",
+                values=(o.get("lpo_no"), o.get("date"), o.get("supplier"),
+                        f"{o.get('value', 0):.2f}"))
+            self._grn_po_index[item] = o
+
+    def _start_grn_for_po(self, po):
+        lines = po.get("lines") or []
+        print(f"[GRN] loaded PO {po.get('lpo_no')}: {len(lines)} line(s)")
+        for i, l in enumerate(lines):
+            print(f"  line[{i}]: {l}")
+
+        if not lines:
+            self.message_error("Empty LPO", "This LPO has no lines.")
+            return
+
+        self._grn_po = po
+        self._grn_pending_lines = list(lines)
+        self._grn_received_lines = []
+        self._grn_line_index = 0
+        self._grn_amend_needed = False
+
+        for r in self._grn_tree.get_children():
+            self._grn_tree.delete(r)
+
+        self._grn_lpo_label_var.set(
+            f"LPO {po.get('lpo_no')} — {po.get('supplier')} — "
+            f"{len(lines)} line(s)")
+
+        self._grn_show_current_line()
+
+    def _grn_show_current_line(self):
+        if self._grn_line_index >= len(self._grn_pending_lines):
+            self._grn_code_var.set("-")
+            self._grn_desc_var.set("-")
+            self._grn_lpo_qty_var.set("-")
+            self._grn_pack_size_var.set("-")
+            self._grn_cost_var.set("-")
+            self._grn_inv_qty_var.set("")
+            self._grn_inv_cost_var.set("")
+            self._update_grn_progress()
+            return
+
+        line = self._grn_pending_lines[self._grn_line_index]
+
+        def _num(v, default=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        barcode = line.get("barcode") or ""
+        # Always prefer the short code.
+        short_code = (line.get("code")
+                      or self._short_code_for_barcode(barcode)
+                      or barcode
+                      or "-")
+        name = line.get("name") or line.get("description") or "-"
+        qty = _num(line.get("qty"))
+        pack_size = _num(line.get("pack_size") or 1)
+        unit_cost = _num(line.get("unit_cost") or line.get("cost") or 0)
+
+        self._grn_code_var.set(short_code)
+        self._grn_desc_var.set(name)
+        self._grn_lpo_qty_var.set(f"{qty:g}")
+        self._grn_pack_size_var.set(f"{pack_size:g}")
+        self._grn_cost_var.set(f"{unit_cost:.2f}")
+
+        self._grn_inv_cost_var.set(f"{unit_cost:.2f}")
+        self._grn_inv_qty_var.set("")
+        self._update_grn_progress()
+
+    def _grn_confirm_line(self):
+        if self._grn_line_index >= len(self._grn_pending_lines):
+            return
+        line = self._grn_pending_lines[self._grn_line_index]
+
+        try:
+            inv_qty = float(self._grn_inv_qty_var.get())
+            if inv_qty <= 0:
+                raise ValueError
+        except ValueError:
+            self.message_error("Invalid", "Invoice qty must be a number > 0.")
+            return
+        try:
+            inv_cost = float(self._grn_inv_cost_var.get())
+            if inv_cost < 0:
+                raise ValueError
+        except ValueError:
+            self.message_error("Invalid", "Cost/pcs must be a number >= 0.")
+            return
+
+        try:
+            lpo_qty = float(line.get("qty") or 0)
+        except (TypeError, ValueError):
+            lpo_qty = 0
+
+        if abs(inv_qty - lpo_qty) > 1e-9:
+            self._grn_amend_needed = True
+            self.message_warn(
+                "LPO does not balance",
+                f"LPO qty: {lpo_qty:g}\n"
+                f"Invoice qty: {inv_qty:g}\n\n"
+                "You must request HQ to amend this LPO to match the invoice "
+                "before this line can be received.\n\n"
+                "This line will be skipped. Fix the LPO and start over.")
+            self._grn_line_index += 1
+            self._grn_show_current_line()
+            return
+
+        try:
+            pack_size = float(line.get("pack_size") or 1)
+        except (TypeError, ValueError):
+            pack_size = 1
+        total_pcs = inv_qty * pack_size
+        line_total = total_pcs * inv_cost
+
+        self._grn_received_lines.append({
+            "barcode": line.get("barcode"),
+            "code": line.get("code"),
+            "qty": inv_qty,
+            "packaging": line.get("packaging"),
+            "pack_size": pack_size,
+            "unit_cost": inv_cost,
+            "notes": line.get("notes", ""),
+        })
+
+        barcode = line.get("barcode") or ""
+        short_code = (line.get("code")
+                      or self._short_code_for_barcode(barcode)
+                      or barcode
+                      or "-")
+        self._grn_tree.insert(
+            "", "end",
+            values=(short_code,
+                    line.get("name", "-"),
+                    f"{inv_qty:g}",
+                    f"{pack_size:g}",
+                    f"{total_pcs:g}",
+                    f"{inv_cost:.2f}",
+                    f"{line_total:.2f}"))
+
+        self._grn_line_index += 1
+        self._grn_show_current_line()
+
+    def _update_grn_progress(self):
+        total = len(self._grn_pending_lines)
+        done = len(self._grn_received_lines)
+        self._grn_progress_var.set(f"{done} / {total} lines confirmed")
+        if done == total and total > 0 and not self._grn_amend_needed:
+            self._grn_receive_btn.configure(state="normal")
+        else:
+            self._grn_receive_btn.configure(state="disabled")
+
+    def _grn_receive_all(self):
+        if not self._grn_po or not self._grn_received_lines:
+            return
+        po = self._grn_po
+        lines = list(self._grn_received_lines)
+        today = datetime.date.today().isoformat()
+        payload = {
+            "supplier": po.get("supplier"),
+            "date": today,
+            "purchase_order_id": po.get("id"),
+            "lines": lines,
+        }
+
+        def worker():
+            try:
+                r = requests.post(f"{self.SERVER}/grn", json=payload, timeout=10)
+                if r.status_code not in (200, 201):
+                    self.after(0, lambda: self.message_error(
+                        "GRN failed", r.text))
+                    return
+                requests.patch(
+                    f"{self.SERVER}/purchase_orders/{po['id']}/receive",
+                    timeout=5)
+            except Exception as e:
+                self.after(0, lambda: self.message_error(
+                    "Error", f"Could not reach server: {e}"))
+                return
+            self.after(0, self._grn_on_success)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _grn_on_success(self):
+        self.message_info("Received",
+                          "GRN saved. Stock updated. LPO marked as received.")
+        self._grn_po = None
+        self._grn_pending_lines = []
+        self._grn_received_lines = []
+        self._grn_line_index = 0
+        self._grn_amend_needed = False
+        for r in self._grn_tree.get_children():
+            self._grn_tree.delete(r)
+        self._grn_lpo_label_var.set("No LPO loaded")
+        self._grn_show_current_line()
